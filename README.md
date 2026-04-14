@@ -18,3 +18,8 @@ Both tools are in development and may be changed in the future.
 
 For documentation see the `README.md` files and the source code.
 
+## Dependancies
+
+Both tools make use of functions from `klib`. In particular
+`extract_transitions` makes use of `knhx.h` and `knhx.h`
+to parse the tree.
