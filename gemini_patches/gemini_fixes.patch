@@ -1,0 +1,162 @@
+diff --git a/extract_transitions/extract_transitions.c b/extract_transitions/extract_transitions.c
+index 279ef83..0612310 100644
+--- a/extract_transitions/extract_transitions.c
++++ b/extract_transitions/extract_transitions.c
+@@ -69,8 +69,9 @@ fh_list open_state_file(const char *fname){
+   fh.parent = fopen(fname, "r");
+   fh.child = fopen(fname, "r");
+   const char *magic = "iqstates";
+-  char *check = malloc(8);
++  char *check = malloc(9); // BUGFIX: Increased allocation to 9 bytes to accommodate null terminator
+   assert( fread((void*)check, 8, 1, fh.parent) == 1);
++  check[8] = '\0'; // BUGFIX: Added null terminator to prevent buffer over-read during strcmp
+   if(strcmp(magic, check)){
+     fprintf(stderr, "missing magic\n");
+     exit(2);
+@@ -85,7 +86,12 @@ fh_list open_state_file(const char *fname){
+     fh.seq_pos[i] = data_start + (i * data_unit_length);
+   // calculate the length of the nodes section
+   fseek(fh.parent, 0, SEEK_END);
+-  size_t names_l = ftell(fh.parent) - names_start;
++  long fsize = ftell(fh.parent);
++  if(fsize < names_start) { // BUGFIX: Added bounds check to prevent arithmetic underflow if file is too small
++    fprintf(stderr, "File too small, missing names block\n");
++    exit(2);
++  }
++  size_t names_l = fsize - names_start;
+   fh.names_buffer = malloc(names_l);
+   fh.node_names = malloc(sizeof(char*) * fh.nodes_n);
+   fseek(fh.parent, names_start, SEEK_SET);
+@@ -175,6 +181,8 @@ tr_counts_kvec count_transitions(fh_list *fh, tree_data *tree, const char *out_f
+       continue;
+     uint32_t fh_p = tree->tree_to_states[p];
+     uint32_t fh_c = tree->tree_to_states[c];
++    if(fh_p == (uint32_t)-1 || fh_c == (uint32_t)-1) // BUGFIX: Safely skip nodes unassigned in the states file to prevent segfaults
++      continue;
+     fseek(fh->parent, fh->seq_pos[fh_p], SEEK_SET);
+     fseek(fh->child,  fh->seq_pos[fh_c], SEEK_SET);
+     assert(fread(parent_buffer, sizeof(uint32_t), read_n, fh->parent) == read_n &&
+@@ -189,8 +197,9 @@ tr_counts_kvec count_transitions(fh_list *fh, tree_data *tree, const char *out_f
+     counts.d = tree->tree[c].d;
+     for(size_t i=0; i < read_n; ++i){
+       for(size_t j=0; j < 8 && (i * 8 + j) < fh->seq_l; ++j){
+-	counts.counts[(((parent_buffer[i] >> (28 - j*8)) << 4) & 0xF0) |
+-		      ((child_buffer[i] >> (28 - j*8)) & 0xF)]++;
++	// BUGFIX: Changed shift multiplier from j*8 to j*4 to prevent negative shift amounts (undefined behavior)
++	counts.counts[(((parent_buffer[i] >> (28 - j*4)) << 4) & 0xF0) |
++		      ((child_buffer[i] >> (28 - j*4)) & 0xF)]++;
+       }
+     }
+     kv_push(transition_counts, tr_counts, counts);
+diff --git a/parse_state_file/state_to_nibble.c b/parse_state_file/state_to_nibble.c
+index e18cbcd..f22f92f 100644
+--- a/parse_state_file/state_to_nibble.c
++++ b/parse_state_file/state_to_nibble.c
+@@ -142,10 +142,14 @@ int read_write_leaves(const char *fname, FILE *state_fd, FILE *lhood_fd,
+       if(((i+1) % 4) == 0)
+ 	assert( fwrite(&qual, sizeof(uint32_t), 1, lhood_fd) == 1);
+     }
+-    if((seq->seq.l % 8) > 0)
+-      assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1 );
+-    if((seq->seq.l % 4) > 0)
+-      assert( fwrite(&qual, sizeof(uint32_t), 1, lhood_fd) == 1);
++    if((seq->seq.l % 8) > 0) {
++      uint32_t p_nibble = nibble << ((8 - (seq->seq.l % 8)) * 4); // BUGFIX: Shift incomplete sequence left so it aligns with the most significant bits when parsed
++      assert( fwrite(&p_nibble, sizeof(uint32_t), 1, state_fd) == 1 );
++    }
++    if((seq->seq.l % 4) > 0) {
++      uint32_t p_qual = qual << ((4 - (seq->seq.l % 4)) * 8); // BUGFIX: Shift incomplete likelihoods left to match alignment
++      assert( fwrite(&p_qual, sizeof(uint32_t), 1, lhood_fd) == 1);
++    }
+   }
+   kseq_destroy(seq);
+   gzclose(fp);
+@@ -241,6 +245,31 @@ int main(int argc, char *argv[])
+       set_kstring(&last_node, node.s, node.l);
+       kv_push(kstring_t, nodes, null_node);
+       set_kstring(&nodes.a[nodes.n-1], node.s, node.l);
++    } else if(strcmp(node.s, last_node.s)){ // BUGFIX: Node transition is checked BEFORE the current line's sequence data is added to the accumulator
++      printf("new node. %s -> %s  seq_i: %u  seq_l: %u  line: %lu\n",
++	     last_node.s, node.s, seq_i-1, seq_l, line_no);
++      nodes_n++;
++      if(seq_l == 0)
++	seq_l = seq_i - 1;
++      if((seq_i - 1) != seq_l){ // error
++	fprintf(stderr, "Length of sequence %s (%u) != %u  at line: %lu\n",
++		last_node.s, seq_i-1, seq_l, line_no);
++	exit(3);
++      }
++      if((seq_i - 1) % 8) {
++	uint32_t p_nibble = nibble << ((8 - ((seq_i - 1) % 8)) * 4); // BUGFIX: Shift partial state sequences left for correct bitwise extraction alignment
++	assert( fwrite(&p_nibble, sizeof(uint32_t), 1, state_fd) == 1);
++      }
++      if((seq_i - 1) % 4) {
++	uint32_t p_lk = nibble_lk << ((4 - ((seq_i - 1) % 4)) * 8);
++	assert( fwrite(&p_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
++      }
++      nibble = 0;
++      nibble_lk = 0;
++      seq_i = 1;
++      set_kstring(&last_node, node.s, node.l);
++      kv_push(kstring_t, nodes, null_node);
++      set_kstring(&nodes.a[nodes.n-1], node.s, node.l);
+     }
+     
+     state = line.s[ offsets[2] ];
+@@ -252,47 +281,21 @@ int main(int argc, char *argv[])
+     assert(max_p <= 1 && "Likelihood larger than 1 encountered\n");
+     
+     nibble = (nibble << 4) | c_to_nibble[state];
+-    nibble_lk = (nibble_lk << 8) | ((uint8_t)( max_p / 255 ));
++    nibble_lk = (nibble_lk << 8) | ((uint8_t)( max_p * 255.0 )); // BUGFIX: Changed division to multiplication to prevent likelihood truncation to 0
+     if((seq_i % 8) == 0){
+       assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1 );
+     }
+     if((seq_i % 4) == 0)
+       assert( fwrite(&nibble_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
+-    
+-    if(strcmp(node.s, last_node.s)){
+-      printf("new node. %s -> %s  seq_i: %u  seq_l: %u  line: %lu\n",
+-	     last_node.s, node.s, seq_i, seq_l, line_no);
+-      nodes_n++;
+-      kv_push(kstring_t, nodes, null_node);
+-      set_kstring(&nodes.a[nodes.n-1], node.s, node.l);
+-      // decrement seq_i, because we have gone past the last entry of
+-      // the last node.
+-      seq_i--;
+-      if(seq_l == 0)
+-	seq_l = seq_i;
+-      if(seq_i != seq_l){ // error
+-	fprintf(stderr, "Length of sequence %s (%u) != %u  at line: %lu\n",
+-		node.s, seq_i, seq_l, line_no);
+-	exit(3);
+-      }
+-      // Otherwise write the last sequence position and likelihoods
+-      // if not already written.
+-      // DO CONSIDER CHECKING THE RETURN VALUES!
+-      if(seq_i % 8)
+-	assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1);
+-      if(seq_i % 4)
+-	assert( fwrite(&nibble_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
+-      nibble = 0;
+-      nibble_lk = 0;
+-      seq_i = 1;
+-      set_kstring(&last_node, node.s, node.l);
+-      continue;
+-    }
+   }
+-  if(seq_i % 8)
+-    assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1);
+-  if(seq_i % 4)
+-    assert( fwrite(&nibble_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
++  if(seq_i % 8) {
++    uint32_t p_nibble = nibble << ((8 - (seq_i % 8)) * 4); // BUGFIX: Pad remaining states for the final sequence
++    assert( fwrite(&p_nibble, sizeof(uint32_t), 1, state_fd) == 1);
++  }
++  if(seq_i % 4) {
++    uint32_t p_lk = nibble_lk << ((4 - (seq_i % 4)) * 8);
++    assert( fwrite(&p_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
++  }
+ 
+   int leaf_er = read_write_leaves(argv[1], state_fd, lhood_fd,
+ 				  seq_l, &nodes);
