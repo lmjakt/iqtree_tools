@@ -7,6 +7,9 @@
 #include "kstring.h"
 #include "kvec.h"
 #include "kseq.h"
+#include "../common/common.h"
+
+// END_NIBBLES, END_QUAL are defined in common.h
 
 // Use kseq's ks_getuntil() to read line by line as in the example at:
 // https://attractivechaos.github.io/klib/#Kseq%3A%20stream%20buffer%20and%20FASTA%2FQ%20parser
@@ -142,10 +145,14 @@ int read_write_leaves(const char *fname, FILE *state_fd, FILE *lhood_fd,
       if(((i+1) % 4) == 0)
 	assert( fwrite(&qual, sizeof(uint32_t), 1, lhood_fd) == 1);
     }
-    if((seq->seq.l % 8) > 0)
+    if((seq->seq.l % 8) > 0){
+      END_NIBBLES(nibble, seq->seq.l);
       assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1 );
-    if((seq->seq.l % 4) > 0)
+    }
+    if((seq->seq.l % 4) > 0){
+      END_QUAL(qual, seq->seq.l);
       assert( fwrite(&qual, sizeof(uint32_t), 1, lhood_fd) == 1);
+    }
   }
   kseq_destroy(seq);
   gzclose(fp);
@@ -190,7 +197,6 @@ int main(int argc, char *argv[])
 
   // These are 32 bit values for compatability with R. 
   // A potential problem in the future.
-  uint32_t nodes_n = 0;
   uint32_t seq_l = 0;
   uint32_t seq_i = 0;
   size_t line_no = 0;
@@ -214,22 +220,26 @@ int main(int argc, char *argv[])
   assert( fwrite(&lhood_magic, 4, sizeof(uint32_t), lhood_fd) == 4);
 
   long seq_l_pos = 2 * sizeof(uint32_t);
-  int in_data = 0;
+  // past_header is used to skip the first line after comments; that
+  // line contains column names. We expect that the header should contain
+  // "Node    Site    State   p_A     p_C     p_G     p_T"
+  // And it would make sense to write a check for this.
+  int past_header = 0;
+  // offsets will hold pointers to a split string
+  // n_fields gives the number of offsets
   int *offsets = 0;
+  int n_fields;
   
   while( ks_getuntil(nodes_ks, '\n', &line, 0) >= 0 ){
     ++line_no;
     if(line.l == 0 || line.s[0] == '#')
       continue;
-    if(!in_data){
-      in_data = 1;
+    if(!past_header){
+      past_header = 1;
       continue;
     }
-    max_p = 0;
-    ++seq_i;
     
     // We expect 7 fields in the file:
-    int n_fields;
     offsets = ksplit(&line, '\t', &n_fields);
     
     if(n_fields != 7){
@@ -242,32 +252,11 @@ int main(int argc, char *argv[])
       kv_push(kstring_t, nodes, null_node);
       set_kstring(&nodes.a[nodes.n-1], node.s, node.l);
     }
-    
-    state = line.s[ offsets[2] ];
-    max_p = 0;
-    for(size_t i=3; i < 7; ++i){
-      float p = atof( line.s + offsets[i] );
-      max_p = p > max_p ? p : max_p;
-    }
-    assert(max_p <= 1 && "Likelihood larger than 1 encountered\n");
-    
-    nibble = (nibble << 4) | c_to_nibble[state];
-    nibble_lk = (nibble_lk << 8) | ((uint8_t)( max_p / 255 ));
-    if((seq_i % 8) == 0){
-      assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1 );
-    }
-    if((seq_i % 4) == 0)
-      assert( fwrite(&nibble_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
-    
     if(strcmp(node.s, last_node.s)){
       printf("new node. %s -> %s  seq_i: %u  seq_l: %u  line: %lu\n",
 	     last_node.s, node.s, seq_i, seq_l, line_no);
-      nodes_n++;
       kv_push(kstring_t, nodes, null_node);
       set_kstring(&nodes.a[nodes.n-1], node.s, node.l);
-      // decrement seq_i, because we have gone past the last entry of
-      // the last node.
-      seq_i--;
       if(seq_l == 0)
 	seq_l = seq_i;
       if(seq_i != seq_l){ // error
@@ -277,23 +266,58 @@ int main(int argc, char *argv[])
       }
       // Otherwise write the last sequence position and likelihoods
       // if not already written.
-      // DO CONSIDER CHECKING THE RETURN VALUES!
-      if(seq_i % 8)
+      // Note: the nibbles are arranged in the order: 1,2,3,4,5,6,7,8
+      //       within the nibble uint32_t. If one more nibble is added
+      //       then is added the resulting nibbles in the integer will be:
+      //       2,3,4,5,6,7,8,9
+      // If that is the last nibble added, then we will want to shift the 9th
+      // nibble to first position (i.e. << 4 * [8 - extra_nibble_no]
+      // where extra_nibble_no will be: (seq_i % 8)
+      // This expression is easy to get wrong, use a macro instead...
+      // 
+      if(seq_i % 8){
+	END_NIBBLES(nibble, seq_i);
 	assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1);
-      if(seq_i % 4)
+      }
+      if(seq_i % 4){
+	END_QUAL(nibble_lk, seq_i);
 	assert( fwrite(&nibble_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
+      }
       nibble = 0;
       nibble_lk = 0;
-      seq_i = 1;
+      seq_i = 0;
       set_kstring(&last_node, node.s, node.l);
-      continue;
     }
-  }
-  if(seq_i % 8)
-    assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1);
-  if(seq_i % 4)
-    assert( fwrite(&nibble_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
+    ++seq_i;
+    
+    state = line.s[ offsets[2] ];
+    max_p = 0;
+    for(size_t i=3; i < 7; ++i){
+      float p = atof( line.s + offsets[i] );
+      max_p = p > max_p ? p : max_p;
+    }
+    assert(max_p <= 1 && "Likelihood larger than 1 encountered\n");
 
+    // Update the nibble and the nibble_lk values
+    nibble = (nibble << 4) | c_to_nibble[state];
+    nibble_lk = (nibble_lk << 8) | ((uint8_t)( max_p * 255.0 ));
+
+    // If the nibble or nibble_lk is complete write to file.
+    if((seq_i % 8) == 0){
+      assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1 );
+    }
+    if((seq_i % 4) == 0)
+      assert( fwrite(&nibble_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
+  }
+  if(seq_i % 8){
+    END_NIBBLES(nibble, seq_i);
+    assert( fwrite(&nibble, sizeof(uint32_t), 1, state_fd) == 1);
+  }
+  if(seq_i % 4){
+    END_QUAL(nibble_lk, seq_i);
+    assert( fwrite(&nibble_lk, sizeof(uint32_t), 1, lhood_fd) == 1);
+  }
+  
   int leaf_er = read_write_leaves(argv[1], state_fd, lhood_fd,
 				  seq_l, &nodes);
   if(leaf_er != 0){
@@ -311,11 +335,20 @@ int main(int argc, char *argv[])
   fseek( state_fd, seq_l_pos, SEEK_SET );
   fseek( lhood_fd, seq_l_pos, SEEK_SET );
 
-  // We can have a single call if I were to use an array.
+  // This was UNDEFINED BEHAVIOUR:
+  // fwrite(&nodes.n, sizeof(uint32_t), 1, state_fd);
+  // 
+  // because nodes.n is size_t (probably 64 bits)
+  // but I'm only writing 32 bits
+  // This works on Small-endian architectures as the first four
+  // bytes are the least significant.
+  // Changed to:
+  
+  uint32_t nodes_n = (uint32_t)nodes.n;
   fwrite(&seq_l, sizeof(uint32_t), 1, state_fd);
   fwrite(&seq_l, sizeof(uint32_t), 1, lhood_fd);
-  fwrite(&nodes.n, sizeof(uint32_t), 1, state_fd);
-  fwrite(&nodes.n, sizeof(uint32_t), 1, lhood_fd);
+  fwrite(&nodes_n, sizeof(uint32_t), 1, state_fd);
+  fwrite(&nodes_n, sizeof(uint32_t), 1, lhood_fd);
   fclose(state_fd);
   fclose(lhood_fd);
 }

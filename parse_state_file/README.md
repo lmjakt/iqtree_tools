@@ -40,13 +40,13 @@ Bytes             Description
 9-12               The length of each sequence. The sequences should be aligned, and hence all 
                    must have the same length.
 				   
-13-17              The number of nodes.
+13-16              The number of nodes.
 
-18-                The extant and ancestral states. Eight bases are encoded within unsigned 32 bit
-18+4*l*n           integers. The actual length of this block is:  
+17-                The extant and ancestral states. Eight bases are encoded within unsigned 32 bit
+17+4*l*n           integers. The actual length of this block is:  
                    `4*l*n + (l % 8 == 0 ? 0 : 4)`
 
-18+4+l*n + 1       The node and leaf names as 0 delimited character arrays.
+17+4+l*n + 1       The node and leaf names as 0 delimited character arrays.
 to end
 ----------------------------------------------------------------------------------------------------
 

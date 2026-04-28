@@ -4,7 +4,7 @@
 #include "kstring.h"
 #include "knhx.h"
 #include "kvec.h"
-
+#include "../common/common.h"
 
 // if defined then print out data structures after parsing
 // to confirm correctness.
@@ -68,13 +68,15 @@ fh_list open_state_file(const char *fname){
   fh_list fh;
   fh.parent = fopen(fname, "r");
   fh.child = fopen(fname, "r");
+  const size_t magic_l = 8;
   const char *magic = "iqstates";
-  char *check = malloc(8);
-  assert( fread((void*)check, 8, 1, fh.parent) == 1);
-  if(strcmp(magic, check)){
+  char *check = malloc(magic_l);
+  assert( fread((void*)check, magic_l, 1, fh.parent) == 1);
+  if(strncmp(magic, check, magic_l)){
     fprintf(stderr, "missing magic\n");
     exit(2);
   }
+  // free check at the end of the function.
   assert( fread(&fh.seq_l, sizeof(uint32_t), 1, fh.parent) == 1);
   assert( fread(&fh.nodes_n, sizeof(uint32_t), 1, fh.parent) == 1);
   fh.seq_pos = malloc(sizeof(size_t) * fh.nodes_n);
@@ -85,7 +87,12 @@ fh_list open_state_file(const char *fname){
     fh.seq_pos[i] = data_start + (i * data_unit_length);
   // calculate the length of the nodes section
   fseek(fh.parent, 0, SEEK_END);
-  size_t names_l = ftell(fh.parent) - names_start;
+  // Consider using fgetpos which returns fpos_t
+  // Or to use fstat() to avoid seeking to the end and back.
+  //
+  long fsize = ftell(fh.parent);
+  assert(fsize > names_start && "File is smaller than expected. Aborting");
+  size_t names_l = (size_t)fsize - names_start;
   fh.names_buffer = malloc(names_l);
   fh.node_names = malloc(sizeof(char*) * fh.nodes_n);
   fseek(fh.parent, names_start, SEEK_SET);
@@ -100,6 +107,7 @@ fh_list open_state_file(const char *fname){
   for(uint32_t i=0; i < fh.nodes_n; ++i)
     fprintf(stderr, "%u : %s\n", i, fh.node_names[i]);
 #endif
+  free(check);
   return(fh);
 }
 
@@ -128,8 +136,6 @@ int make_tree_to_state_index(fh_list *fh, tree_data *tree){
   }
   return(unassigned);
 }
-
-
 
 tree_data parse_tree(const char *fname){
   FILE *nwk_file = fopen(fname, "r");
@@ -175,8 +181,12 @@ tr_counts_kvec count_transitions(fh_list *fh, tree_data *tree, const char *out_f
       continue;
     uint32_t fh_p = tree->tree_to_states[p];
     uint32_t fh_c = tree->tree_to_states[c];
-    fseek(fh->parent, fh->seq_pos[fh_p], SEEK_SET);
-    fseek(fh->child,  fh->seq_pos[fh_c], SEEK_SET);
+    // Check for unassigned nodes:
+    assert( fh_p != (uint32_t)-1 && fh_c != (uint32_t)-1 && "Either parent or child lacks a file handle");
+    // fseek returns -1 on error, 0 otherwise. We can assert this
+    assert( fseek(fh->parent, fh->seq_pos[fh_p], SEEK_SET) == 0 && "Failed to seek to parent location");
+    assert( fseek(fh->child,  fh->seq_pos[fh_c], SEEK_SET) == 0 && "Failed to seek to child location");
+
     assert(fread(parent_buffer, sizeof(uint32_t), read_n, fh->parent) == read_n &&
 	   "Failed to read states from parent" );
     assert(fread(child_buffer, sizeof(uint32_t), read_n, fh->child) == read_n &&
@@ -189,8 +199,8 @@ tr_counts_kvec count_transitions(fh_list *fh, tree_data *tree, const char *out_f
     counts.d = tree->tree[c].d;
     for(size_t i=0; i < read_n; ++i){
       for(size_t j=0; j < 8 && (i * 8 + j) < fh->seq_l; ++j){
-	counts.counts[(((parent_buffer[i] >> (28 - j*8)) << 4) & 0xF0) |
-		      ((child_buffer[i] >> (28 - j*8)) & 0xF)]++;
+	counts.counts[(((parent_buffer[i] >> (28 - j*4)) << 4) & 0xF0) |
+		      ((child_buffer[i] >> (28 - j*4)) & 0xF)]++;
       }
     }
     kv_push(transition_counts, tr_counts, counts);
